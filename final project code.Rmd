@@ -1,0 +1,1113 @@
+---
+title: "Beyond Failing to Reject: A Bayesian Approach to Evaluating the Andilaye WASH Intervention"
+subtitle: "Final Project for CSSS 564 (Spring 2026)"
+author: "Yuwei Wang & William Garcia"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+## 1. Research Question & Data 
+
+```{r setup, echo = T}
+rm(list = ls()) # Clear the workspace
+# Standard configuration for the course
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(tidyverse)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+library(rjags)
+library(coda)
+library(haven)
+library(loo)
+library(gridExtra)
+library(scales)
+
+# 0. Load raw data & select only needed columns upfront -----
+f1_cols <- paste0("F_1_", 1:10)
+f2_cols <- paste0("F_2_", 1:13)
+ 
+# From hh_members files: hh_id, Z_1, A_1_13 (baseline only), item scores
+baseline_hh_members <- read_dta("all_hh_members.dta") %>%
+  select(hh_id, Z_1, A_1_13, all_of(c(f1_cols, f2_cols)))
+ 
+endline_hh_members <- read_dta("all_hh_members_end.dta") %>%
+  select(hh_id, Z_1, all_of(c(f1_cols, f2_cols)))
+ 
+# From hh_lat files: hh_id, Z_1, A_1_13 (baseline), A_1_5, A_1_6, rand_var
+baseline_hh_lat <- read_dta("all_hh_lat.dta") %>%
+  select(hh_id, Z_1, A_1_13, A_1_5, A_1_6, rand_var)
+ 
+endline_hh_lat <- read_dta("all_hh_lat_end.dta") %>%
+  select(hh_id, Z_1, A_1_5, A_1_6, rand_var)
+
+# 1. Helper: score items and aggregate to household-level binary outcomes ----
+
+#    The mental health instrument used in Andilaye is a 23-item adaptation of
+#    the Hopkins Symptom Checklist (HSCL), scored 0-3 per item (not 1-4 as in
+#    the original HSCL-25). The standard HSCL caseness cutoff is mean >= 1.75
+#    on the 1-4 scale, which is equivalent to mean >= 0.75 on the 0-3 scale
+#    used here. We apply the scale-corrected threshold (>= 0.75) throughout.
+
+#    Step 1 — filter to completed interviews
+#    Step 2 — recode 888/999 to NA
+#    Step 3 — compute individual-level subscale means (rowMeans, na.rm)
+#    Step 4 — average across household members to one score per household
+#    Step 5 — apply caseness threshold >= 0.75 on 0-3 scale
+
+score_outcomes <- function(mem_df, z1_val = 5, a113_filter = FALSE) {
+ 
+  d <- mem_df %>% filter(Z_1 == z1_val)
+  if (a113_filter) d <- d %>% filter(A_1_13 != 0)
+ 
+  d <- d %>%
+    mutate(across(all_of(c(f1_cols, f2_cols)),
+                  ~ na_if(na_if(., 888), 999)),
+           anxiety_mean    = rowMeans(across(all_of(f1_cols)), na.rm = TRUE),
+           depression_mean = rowMeans(across(all_of(f2_cols)), na.rm = TRUE),
+           distress_mean   = rowMeans(across(all_of(c(f1_cols, f2_cols))),
+                                      na.rm = TRUE))
+ 
+  d %>%
+    group_by(hh_id) %>%
+    summarise(
+      avg_anxiety_mean    = mean(anxiety_mean,    na.rm = TRUE),
+      avg_depression_mean = mean(depression_mean, na.rm = TRUE),
+      avg_distress_mean   = mean(distress_mean,   na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      anxiety    = if_else(is.nan(avg_anxiety_mean),
+                           NA_real_, as.numeric(avg_anxiety_mean    >= 0.75)),
+      depression = if_else(is.nan(avg_depression_mean),
+                           NA_real_, as.numeric(avg_depression_mean >= 0.75)),
+      emotion    = if_else(is.nan(avg_distress_mean),
+                           NA_real_, as.numeric(avg_distress_mean   >= 0.75))
+    ) %>%
+    select(hh_id, anxiety, depression, emotion)
+}
+
+# 2. Helper: build the lat-side covariate frame (identifiers + design vars)-----
+build_lat <- function(lat_df, z1_val = 5, a113_filter = FALSE) {
+ 
+  d <- lat_df %>%
+    distinct(hh_id, .keep_all = TRUE) %>%
+    filter(Z_1 == z1_val)
+  if (a113_filter) d <- d %>% filter(A_1_13 != 0)
+ 
+  d %>%
+    mutate(
+      treatment = as.integer(rand_var),
+      # woreda_id: integer 1:3 passed directly to JAGS as an index
+      #   1 = Farta  (reference; gamma[1] <- 0 imposed in JAGS model string)
+      #   2 = Fogera
+      #   3 = Bahir Dar Zuria
+      woreda_id = case_when(
+        A_1_5 == 100 ~ 1L,
+        A_1_5 == 200 ~ 2L,
+        A_1_5 == 300 ~ 3L
+      ),
+      # Re-index A_1_6 to contiguous 1:50 — required for JAGS
+      # (raw A_1_6 has gaps: values up to 58 with only 50 unique levels)
+      cluster_id = as.integer(factor(A_1_6))
+    ) %>%
+    select(hh_id, cluster_id, treatment, woreda_id)
+}
+
+# 3. Build endline dataset (primary analysis)
+endline_outcomes <- score_outcomes(endline_hh_members, a113_filter = FALSE)
+endline_lat      <- build_lat(endline_hh_lat,          a113_filter = FALSE)
+ 
+endline_clean <- inner_join(endline_outcomes, endline_lat, by = "hh_id")
+
+# 4. Build baseline outcomes (for ANCOVA sensitivity model) ----
+baseline_outcomes <- score_outcomes(baseline_hh_members, a113_filter = TRUE) %>%
+  rename(anxiety_bl    = anxiety,
+         depression_bl = depression,
+         emotion_bl    = emotion)
+
+# 5. Build panel dataset: endline + baseline outcomes joined by hh_id
+## 4 endline households have no baseline record (Z_1 != 5 at baseline)
+## their _bl variables will be NA. 
+## This is expected and documented.
+panel_clean <- endline_clean %>%
+  left_join(baseline_outcomes, by = "hh_id")
+```
+
+**Research Question**: What is the posterior probability that the Average Predictive Difference (APD) — the average difference in predicted caseness probability between intervention and control households — falls within [-0.05, +0.05] for each of the three mental health outcomes? And what is the full posterior distribution of between-cluster variance in mental health outcomes across the 50 kebeles?
+
+## 2. Model Specification
+
+We fit a Bayesian hierarchical logistic regression separately for each of the three binary outcomes (`anxiety`, `depression`, `emotion`). Let $i$ index households ($i = 1, \ldots, N$), $j[i]$ index the kebele cluster for household $i$ ($j = 1, \ldots, 50$), and $w[i] \in \{1, 2, 3\}$ denote the woreda index.
+
+**Likelihood.** Each binary outcome $y_i$ is modeled as:
+
+$$y_i \mid p_i \sim \text{Bernoulli}(p_i)$$
+
+$$\text{logit}(p_i) = \alpha_{j[i]} + \beta_{\text{trt}} \cdot x_i^{\text{trt}} + \gamma_{w[i]}$$
+
+where $x_i^{\text{trt}}$ is the binary treatment indicator (1 = intervention, 0 = control), $\alpha_{j[i]}$ is the random intercept for kebele $j[i]$, and $\gamma_{w[i]}$ is the fixed woreda effect. Farta is the reference category, enforced by the constraint $\gamma_1 = 0$.
+
+**Cluster-level random intercepts.** Kebele intercepts are modeled as exchangeable draws from a common Normal distribution:
+
+$$\alpha_j \mid \mu_0,\, \sigma_{\text{cluster}} \sim \mathcal{N}(\mu_0,\, \sigma_{\text{cluster}}^2), \quad j = 1, \ldots, 50$$
+
+This partial-pooling structure allows each cluster to have its own baseline log-odds while borrowing information across clusters. Exchangeability is justified by the study design: kebeles were randomly selected and randomly assigned, and there is no a priori reason to expect any particular kebele to differ from the others in ways not already captured by the woreda fixed effects.
+
+**Prior distributions.**
+
+$$\beta_{\text{trt}} \sim \mathcal{N}(0,\, 1^2)$$
+$$\gamma_1 = 0, \quad \gamma_2,\, \gamma_3 \sim \mathcal{N}(0,\, 1^2)$$
+$$\mu_0 \sim \mathcal{N}(0,\, 1^2)$$
+$$\sigma_{\text{cluster}} \sim \text{Half-}t(3,\, 0,\, 2.5)$$
+
+The prior on $\beta_{\text{trt}}$ is weakly informative and centered at zero, placing 95% of its mass between log-ORs of approximately $-2$ and $+2$ (odds ratios 0.14 to 7.4). This reflects genuine equipoise: WASH observational associations with mental health do not straightforwardly translate into intervention effects of similar size, and the published trial results show prevalence ratios close to one. The $\text{Half-}t(3,\, 0,\, 2.5)$ prior on $\sigma_{\text{cluster}}$ follows Gelman (2006) for hierarchical variance parameters in logistic models, and is consistent with the ICCs (0.01–0.10) reported for comparable African community-based trials (Delea et al., 2019). We also conduct a sensitivity analysis replacing $\beta_{\text{trt}} \sim \mathcal{N}(0, 1)$ with a more diffuse $\mathcal{N}(0,\, 2.5^2)$ to assess prior sensitivity.
+
+**Primary estimand: Average Predictive Difference (APD).** The structural parameter $\beta_{\text{trt}}$ operates on the log-odds scale and is not directly interpretable for an implementation-science audience. The quantity that directly answers the research question is the APD — the average difference in predicted caseness probability between intervention and control, integrating over the full posterior uncertainty in all model parameters. For each posterior draw $s$:
+
+$$\widehat{\text{APD}}^{(s)} = \frac{1}{N} \sum_{i=1}^{N} \left[\text{logit}^{-1}\!\left(\alpha_{j[i]}^{(s)} + \beta_{\text{trt}}^{(s)} + \gamma_{w[i]}^{(s)}\right) - \text{logit}^{-1}\!\left(\alpha_{j[i]}^{(s)} + \gamma_{w[i]}^{(s)}\right)\right]$$
+
+We report the posterior mean, 95% HDI, the posterior probability that $|\widehat{\text{APD}}^{(s)}| < 0.05$ (inside the ROPE $[-0.05,\, +0.05]$), and the reciprocal $1/|\overline{\text{APD}}|$ as the Number Needed to Treat. We also report the posterior distribution of $\sigma_{\text{cluster}}$ and the implied ICC computed draw-by-draw as $\sigma_{\text{cluster}}^{(s)2} / (\sigma_{\text{cluster}}^{(s)2} + \pi^2/3)$.
+
+**Sensitivity model (ANCOVA).** A second model augments the linear predictor with each household's baseline caseness status $y_i^{\text{bl}} \in \{0, 1\}$:
+
+$$\text{logit}(p_i) = \alpha_{j[i]} + \beta_{\text{trt}} \cdot x_i^{\text{trt}} + \gamma_{w[i]} + \delta \cdot y_i^{\text{bl}}, \quad \delta \sim \mathcal{N}(0,\, 1)$$
+
+Including baseline outcome is causally clean (measured before randomization) and justified on efficiency grounds. The two models are compared via PSIS-LOO on the common subsample of 1,468 households (4 households lack a baseline record). If LOO favors the ANCOVA model by more than 2 SEs in ELPD, we report both sets of APD estimates; otherwise the primary model is preferred on parsimony grounds.
+
+```{r model-spec}
+# --- Primary JAGS model string ---
+model_string_primary <- "
+model {
+  for (i in 1:N) {
+    y[i] ~ dbern(p[i])
+    logit(p[i]) <- alpha[cluster[i]] + beta_trt * trt[i] + gamma[woreda[i]]
+  }
+  for (j in 1:J) {
+    alpha[j] ~ dnorm(mu0, tau_cluster)
+  }
+  beta_trt      ~ dnorm(0, 1)
+  gamma[1]      <- 0
+  for (k in 2:3) {
+    gamma[k]    ~ dnorm(0, 1)
+  }
+  mu0           ~ dnorm(0, 1)
+  sigma_cluster ~ dt(0, pow(2.5, -2), 3) T(0, )
+  tau_cluster   <- pow(sigma_cluster, -2)
+}
+"
+
+# --- Sensitivity model: adds baseline caseness covariate (ANCOVA) ---
+model_string_ancova <- "
+model {
+  for (i in 1:N) {
+    y[i] ~ dbern(p[i])
+    logit(p[i]) <- alpha[cluster[i]] + beta_trt * trt[i] + gamma[woreda[i]] + delta * y_bl[i]
+  }
+  for (j in 1:J) {
+    alpha[j] ~ dnorm(mu0, tau_cluster)
+  }
+  beta_trt      ~ dnorm(0, 1)
+  delta         ~ dnorm(0, 1)
+  gamma[1]      <- 0
+  for (k in 2:3) {
+    gamma[k]    ~ dnorm(0, 1)
+  }
+  mu0           ~ dnorm(0, 1)
+  sigma_cluster ~ dt(0, pow(2.5, -2), 3) T(0, )
+  tau_cluster   <- pow(sigma_cluster, -2)
+}
+"
+
+# --- Data list helpers ---
+make_jags_data <- function(df, outcome_col) {
+  list(
+    y       = as.integer(df[[outcome_col]]),
+    trt     = df$treatment,
+    cluster = df$cluster_id,
+    woreda  = df$woreda_id,
+    N       = nrow(df),
+    J       = 50L
+  )
+}
+
+make_jags_data_ancova <- function(df, outcome_col, bl_col) {
+  list(
+    y       = as.integer(df[[outcome_col]]),
+    y_bl    = as.integer(df[[bl_col]]),
+    trt     = df$treatment,
+    cluster = df$cluster_id,
+    woreda  = df$woreda_id,
+    N       = nrow(df),
+    J       = 50L
+  )
+}
+
+# Primary model data lists (N = 1,472)
+jags_data_anxiety    <- make_jags_data(endline_clean, "anxiety")
+jags_data_depression <- make_jags_data(endline_clean, "depression")
+jags_data_emotion    <- make_jags_data(endline_clean, "emotion")
+
+# ANCOVA data lists (N = 1,468; excludes 4 households missing baseline)
+panel_ancova <- panel_clean %>% filter(!is.na(anxiety_bl))
+
+jags_data_ancova_anxiety    <- make_jags_data_ancova(panel_ancova, "anxiety",    "anxiety_bl")
+jags_data_ancova_depression <- make_jags_data_ancova(panel_ancova, "depression", "depression_bl")
+jags_data_ancova_emotion    <- make_jags_data_ancova(panel_ancova, "emotion",    "emotion_bl")
+```
+
+## 3. Prior Predictive Check
+
+Prior predictive simulation draws parameters from the prior distributions alone — without conditioning on any observed outcome data — and uses those draws to generate hypothetical datasets. This reveals what kinds of data the model considers plausible before seeing any evidence, and verifies that the prior specification is neither too restrictive nor too diffuse.
+
+```{r prior-predictive, cache=TRUE}
+set.seed(564)
+S <- 1000L
+
+N           <- nrow(endline_clean)
+cluster_idx <- endline_clean$cluster_id
+woreda_idx  <- endline_clean$woreda_id
+trt_vec     <- endline_clean$treatment
+
+prev_prior  <- numeric(S)
+apd_prior   <- numeric(S)
+sigma_prior <- numeric(S)
+icc_prior   <- numeric(S)
+
+for (s in seq_len(S)) {
+  mu0           <- rnorm(1, 0, 1)
+  sigma_cluster <- abs(rt(1, df = 3) * 2.5)          # Half-t(3, 0, 2.5)
+  alpha         <- rnorm(50L, mu0, sigma_cluster)
+  beta_trt      <- rnorm(1, 0, 1)
+  gamma         <- c(0, rnorm(2, 0, 1))
+
+  eta   <- alpha[cluster_idx] + beta_trt * trt_vec + gamma[woreda_idx]
+  p     <- plogis(eta)
+  y_sim <- rbinom(N, 1L, p)
+
+  p_trt  <- plogis(alpha[cluster_idx] + beta_trt + gamma[woreda_idx])
+  p_ctrl <- plogis(alpha[cluster_idx]             + gamma[woreda_idx])
+
+  prev_prior[s]  <- mean(y_sim)
+  apd_prior[s]   <- mean(p_trt - p_ctrl)
+  sigma_prior[s] <- sigma_cluster
+  icc_prior[s]   <- sigma_cluster^2 / (sigma_cluster^2 + pi^2 / 3)
+}
+
+ppc_draws <- tibble(
+  prev  = prev_prior,
+  apd   = apd_prior,
+  sigma = sigma_prior,
+  icc   = icc_prior
+)
+```
+
+**Figure 1** shows the prior predictive distribution of sample-level caseness prevalence. Under the chosen priors, predicted prevalences span the full range from near 0% to near 100%, with a median near 50% and substantial mass between 5% and 95%. The observed endline prevalences (depression 15.6%, anxiety 23.5%, emotional distress 18.5%) lie comfortably within the prior predictive distribution, confirming the prior does not conflict with the data before any conditioning has occurred.
+
+```{r ppc-prevalence-plot, fig.width=6, fig.height=3.5}
+obs_prev <- tibble(
+  outcome = c("Depression", "Anxiety", "Emotional distress"),
+  prev    = c(mean(endline_clean$depression), mean(endline_clean$anxiety),
+              mean(endline_clean$emotion))
+)
+
+ggplot(ppc_draws, aes(x = prev)) +
+  geom_histogram(bins = 60, fill = "steelblue", alpha = 0.7, color = NA) +
+  geom_vline(data = obs_prev,
+             aes(xintercept = prev, linetype = outcome, color = outcome),
+             linewidth = 0.8) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(0, 1)) +
+  scale_color_manual(values = c("Depression"        = "#d62728",
+                                "Anxiety"           = "#2ca02c",
+                                "Emotional distress"= "#9467bd")) +
+  scale_linetype_manual(values = c("Depression"        = "solid",
+                                   "Anxiety"           = "dashed",
+                                   "Emotional distress"= "dotted")) +
+  labs(x = "Sample caseness prevalence", y = "Prior predictive draws",
+       color = NULL, linetype = NULL,
+       title    = "Figure 1. Prior predictive distribution of caseness prevalence",
+       subtitle = "Vertical lines mark observed endline prevalences") +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+**Figure 2** shows the prior predictive distribution of the APD. Because the prior on $\beta_{\text{trt}}$ is centered at zero, the prior APD is also centered near zero but has heavier tails than the log-OR prior, reflecting the nonlinearity of the inverse-logit transformation. The prior assigns substantial probability both inside and outside the ROPE $[-0.05, +0.05]$, confirming the ROPE analysis is not predetermined.
+
+```{r ppc-apd-plot, fig.width=6, fig.height=3.5}
+rope_prob <- mean(abs(apd_prior) < 0.05)
+
+ggplot(ppc_draws, aes(x = apd)) +
+  annotate("rect", xmin = -0.05, xmax = 0.05, ymin = -Inf, ymax = Inf,
+           fill = "gold", alpha = 0.3) +
+  geom_histogram(bins = 80, fill = "steelblue", alpha = 0.7, color = NA) +
+  geom_vline(xintercept = c(-0.05, 0.05), linetype = "dashed", linewidth = 0.7) +
+  geom_vline(xintercept = 0, linetype = "solid",  linewidth = 0.4, color = "grey40") +
+  annotate("text", x = 0, y = Inf, vjust = 1.5,
+           label = sprintf("Prior P(APD in ROPE) = %.0f%%", rope_prob * 100),
+           size = 3.5) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(x = "Average Predictive Difference (APD)", y = "Prior predictive draws",
+       title    = "Figure 2. Prior predictive distribution of the APD",
+       subtitle = "Shaded band = ROPE [-0.05, +0.05]") +
+  theme_bw(base_size = 11)
+```
+
+```{r ppc-summary}
+ppc_summary <- ppc_draws %>%
+  summarise(
+    prev_median   = median(prev),
+    prev_q025     = quantile(prev, 0.025),
+    prev_q975     = quantile(prev, 0.975),
+    apd_median    = median(apd),
+    apd_q025      = quantile(apd, 0.025),
+    apd_q975      = quantile(apd, 0.975),
+    rope_prob     = mean(abs(apd) < 0.05),
+    icc_median    = median(icc),
+    icc_q025      = quantile(icc, 0.025),
+    icc_q975      = quantile(icc, 0.975)
+  )
+
+ppc_summary %>%
+  pivot_longer(everything()) %>%
+  mutate(value = round(value, 3)) %>%
+  kable(col.names = c("Quantity", "Value"),
+        caption   = "Prior predictive summary statistics") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+The implied prior ICC — computed draw-by-draw as $\sigma_{\text{cluster}}^{(s)2} / (\sigma_{\text{cluster}}^{(s)2} + \pi^2/3)$ — has a median near 0.20 with a wide 95% credible interval, appropriate given the limited prior evidence on clustering of mental health outcomes in kebele-level Ethiopian trials. Overall, the prior predictive check confirms the chosen priors are appropriately weakly informative: they are consistent with a broad range of plausible outcomes without generating pathological predictions such as prevalences of exactly 0% or 100%.
+
+## 4. Model Fitting
+
+All six models (3 outcomes × primary + ANCOVA) are fit using JAGS via `rjags`. Each model runs 3 independent chains with 1,000 adaptation iterations, 5,000 burn-in iterations (discarded), and 10,000 post-burn-in iterations thinned by 2, yielding 5,000 draws per chain (15,000 total). We monitor `beta_trt`, `gamma`, `mu0`, `sigma_cluster`, and all 50 `alpha` intercepts; the latter are needed for the APD computation in Section 6. Convergence diagnostics are reported in Section 5.
+
+```{r mcmc-settings}
+n_chains <- 3L
+n_adapt  <- 1000L
+n_burnin <- 5000L
+n_iter   <- 10000L
+n_thin   <- 2L
+
+params_primary <- c("beta_trt", "gamma", "mu0", "sigma_cluster", "alpha")
+params_ancova  <- c(params_primary, "delta")
+
+fit_jags <- function(model_string, data_list, params, seed_offset = 0L) {
+  set.seed(564L + seed_offset)
+  m <- jags.model(
+    textConnection(model_string),
+    data     = data_list,
+    n.chains = n_chains,
+    n.adapt  = n_adapt,
+    quiet    = TRUE
+  )
+  update(m, n.iter = n_burnin, progress.bar = "none")
+  coda.samples(m,
+               variable.names = params,
+               n.iter         = n_iter,
+               thin           = n_thin,
+               progress.bar   = "none")
+}
+```
+
+```{r fit-primary, cache=TRUE, dependson="mcmc-settings"}
+fit_anxiety    <- fit_jags(model_string_primary, jags_data_anxiety,    params_primary, 0L)
+fit_depression <- fit_jags(model_string_primary, jags_data_depression, params_primary, 1L)
+fit_emotion    <- fit_jags(model_string_primary, jags_data_emotion,    params_primary, 2L)
+```
+
+```{r fit-ancova, cache=TRUE, dependson="mcmc-settings"}
+fit_ancova_anxiety    <- fit_jags(model_string_ancova, jags_data_ancova_anxiety,    params_ancova, 3L)
+fit_ancova_depression <- fit_jags(model_string_ancova, jags_data_ancova_depression, params_ancova, 4L)
+fit_ancova_emotion    <- fit_jags(model_string_ancova, jags_data_ancova_emotion,    params_ancova, 5L)
+```
+
+```{r fit-sensitivity, cache=TRUE, dependson="mcmc-settings"}
+# Sensitivity analysis: diffuse prior on beta_trt ~ N(0, 2.5^2)
+model_string_diffuse <- gsub(
+  "beta_trt      ~ dnorm(0, 1)",
+  "beta_trt      ~ dnorm(0, pow(2.5, -2))",
+  model_string_primary, fixed = TRUE
+)
+
+fit_diffuse_anxiety    <- fit_jags(model_string_diffuse, jags_data_anxiety,    params_primary, 6L)
+fit_diffuse_depression <- fit_jags(model_string_diffuse, jags_data_depression, params_primary, 7L)
+fit_diffuse_emotion    <- fit_jags(model_string_diffuse, jags_data_emotion,    params_primary, 8L)
+```
+
+```{r fit-summary-table}
+extract_scalar <- function(fit, param) {
+  as.matrix(fit)[, param, drop = FALSE] |> as.vector()
+}
+
+make_fit_table <- function(fit, label) {
+  samps <- as.matrix(fit)
+  tibble(
+    Model      = label,
+    Parameter  = c("beta_trt", "sigma_cluster", "mu0"),
+    Mean       = colMeans(samps[, c("beta_trt", "sigma_cluster", "mu0")]),
+    SD         = apply(samps[, c("beta_trt", "sigma_cluster", "mu0")], 2, sd),
+    `2.5%`     = apply(samps[, c("beta_trt", "sigma_cluster", "mu0")], 2,
+                       quantile, 0.025),
+    `97.5%`    = apply(samps[, c("beta_trt", "sigma_cluster", "mu0")], 2,
+                       quantile, 0.975)
+  )
+}
+
+bind_rows(
+  make_fit_table(fit_anxiety,    "Anxiety (primary)"),
+  make_fit_table(fit_depression, "Depression (primary)"),
+  make_fit_table(fit_emotion,    "Emotion (primary)")
+) %>%
+  mutate(across(where(is.numeric), round, 3)) %>%
+  kable(caption = "Posterior summaries for key scalar parameters — primary models") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE, font_size = 10)
+```
+
+## 5. MCMC Diagnostics
+
+We assess convergence using the Gelman-Rubin statistic $\hat{R}$ (Gelman & Rubin, 1992) and effective sample size (ESS). We require $\hat{R} < 1.05$ for all monitored parameters. Visual inspection via trace plots and autocorrelation of $\beta_{\text{trt}}$ completes the assessment. All diagnostics are reported for the primary models; ANCOVA and diffuse-prior models showed similar patterns.
+
+```{r diagnostics-setup, dependson=c("fit-primary")}
+key_params <- c("beta_trt", "gamma[2]", "gamma[3]", "mu0", "sigma_cluster")
+
+# gelman.diag fails on zero-variance columns (gamma[1] <- 0)
+remove_constants <- function(fit) {
+  keep <- apply(as.matrix(fit), 2, var) > 0
+  mcmc.list(lapply(fit, function(ch)
+    mcmc(as.matrix(ch)[, keep, drop = FALSE],
+         start = start(ch), end = end(ch), thin = thin(ch))))
+}
+
+diag_summary <- function(fit, outcome) {
+  fit_c <- remove_constants(fit)
+  rhat  <- gelman.diag(fit_c, multivariate = FALSE)$psrf
+  ess   <- effectiveSize(fit_c)
+
+  scalar <- tibble(
+    Outcome   = outcome,
+    Parameter = key_params,
+    Rhat      = round(rhat[key_params, 1], 3),
+    Rhat_max  = round(rhat[key_params, 2], 3),
+    ESS       = as.integer(round(ess[key_params]))
+  )
+
+  alpha_idx  <- grep("^alpha\\[", rownames(rhat), value = TRUE)
+  alpha_row  <- tibble(
+    Outcome   = outcome,
+    Parameter = "alpha[1:50]",
+    Rhat      = round(median(rhat[alpha_idx, 1]), 3),
+    Rhat_max  = round(max(rhat[alpha_idx, 1]),    3),
+    ESS       = as.integer(round(median(ess[alpha_idx])))
+  )
+
+  bind_rows(scalar, alpha_row)
+}
+
+diag_df <- bind_rows(
+  diag_summary(fit_anxiety,    "Anxiety"),
+  diag_summary(fit_depression, "Depression"),
+  diag_summary(fit_emotion,    "Emotion")
+)
+```
+
+```{r diagnostics-table}
+diag_df %>%
+  kable(
+    col.names = c("Outcome", "Parameter", "R-hat", "R-hat (max/UCI)", "ESS"),
+    caption   = paste(
+      "Table 2. MCMC convergence diagnostics — primary models.",
+      "For alpha[1:50], R-hat is the median and R-hat (max/UCI) is the maximum",
+      "across the 50 cluster intercepts; ESS is the median."
+    )
+  ) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE, font_size = 10) %>%
+  row_spec(which(diag_df$Rhat_max > 1.05), background = "#fff3cd")
+```
+
+```{r diagnostics-trace, fig.width = 8, fig.height = 5.5, dependson="fit-primary"}
+tidy_traces <- function(fit, params, outcome) {
+  bind_rows(lapply(seq_along(fit), function(ch) {
+    as.data.frame(fit[[ch]]) %>%
+      select(all_of(params)) %>%
+      mutate(chain = factor(ch), iter = row_number())
+  })) %>%
+    pivot_longer(all_of(params), names_to = "parameter", values_to = "value") %>%
+    mutate(outcome = outcome)
+}
+
+trace_df <- bind_rows(
+  tidy_traces(fit_anxiety,    c("beta_trt", "sigma_cluster"), "Anxiety"),
+  tidy_traces(fit_depression, c("beta_trt", "sigma_cluster"), "Depression"),
+  tidy_traces(fit_emotion,    c("beta_trt", "sigma_cluster"), "Emotion")
+) %>%
+  mutate(
+    parameter = recode(parameter,
+                       "beta_trt"      = "beta[trt]",
+                       "sigma_cluster" = "sigma[cluster]"),
+    outcome   = factor(outcome, levels = c("Anxiety", "Depression", "Emotion"))
+  )
+
+ggplot(trace_df, aes(x = iter, y = value, color = chain)) +
+  geom_line(alpha = 0.5, linewidth = 0.25) +
+  facet_grid(parameter ~ outcome, scales = "free_y", labeller = label_parsed) +
+  scale_color_brewer(palette = "Set1") +
+  labs(
+    x        = "Post-burn-in iteration",
+    y        = "Parameter value",
+    color    = "Chain",
+    title    = "Figure 3. Trace plots — primary models",
+    subtitle = "Rows: treatment log-OR and cluster SD; columns: outcomes"
+  ) +
+  theme_bw(base_size = 10) +
+  theme(legend.position = "bottom", strip.text = element_text(size = 9))
+```
+
+```{r diagnostics-autocorr, fig.width = 7, fig.height = 3, dependson="fit-primary"}
+acf_tidy <- function(fit, outcome) {
+  bind_rows(lapply(seq_along(fit), function(ch) {
+    x   <- as.matrix(fit[[ch]])[, "beta_trt"]
+    obj <- acf(x, lag.max = 30, plot = FALSE)
+    tibble(lag = as.vector(obj$lag), acf = as.vector(obj$acf),
+           chain = factor(ch))
+  })) %>% mutate(outcome = outcome)
+}
+
+acf_df  <- bind_rows(
+  acf_tidy(fit_anxiety,    "Anxiety"),
+  acf_tidy(fit_depression, "Depression"),
+  acf_tidy(fit_emotion,    "Emotion")
+)
+ci_line <- qnorm(0.975) / sqrt(5000L)
+
+ggplot(acf_df, aes(x = lag, y = acf, color = chain)) +
+  geom_hline(yintercept = c(-ci_line, ci_line),
+             linetype = "dashed", color = "grey50") +
+  geom_hline(yintercept = 0, color = "grey20", linewidth = 0.3) +
+  geom_segment(aes(xend = lag, yend = 0), alpha = 0.7, linewidth = 0.4) +
+  facet_wrap(~ outcome, nrow = 1) +
+  scale_color_brewer(palette = "Set1") +
+  labs(
+    x        = "Lag",
+    y        = "Autocorrelation",
+    color    = "Chain",
+    title    = "Figure 4. Autocorrelation of beta_trt — primary models",
+    subtitle = "Dashed lines: 95% CI bounds for zero autocorrelation (n = 5,000)"
+  ) +
+  theme_bw(base_size = 10) +
+  theme(legend.position = "bottom")
+```
+
+## 6. Posterior Inference
+
+We report the posterior APD, 95% HDI, posterior probability inside the ROPE $[-0.05, +0.05]$, and implied NNT for each outcome. We then characterize the between-cluster variance, compare the primary and ANCOVA models via LOO, and assess sensitivity to the treatment prior.
+
+```{r inference-helpers, dependson = c("fit-primary", "fit-ancova", "fit-sensitivity")}
+# APD: average over all N households of the counterfactual probability difference
+compute_apd <- function(fit, df) {
+  samps      <- as.matrix(fit)
+  alpha_mat  <- samps[, paste0("alpha[", df$cluster_id, "]"), drop = FALSE]
+  gamma_all  <- cbind(0, samps[, "gamma[2]"], samps[, "gamma[3]"])
+  gamma_mat  <- gamma_all[, df$woreda_id, drop = FALSE]
+  beta_vec   <- samps[, "beta_trt"]
+  eta_base   <- alpha_mat + gamma_mat
+  eta_trt    <- sweep(eta_base, 1, beta_vec, "+")
+  rowMeans(plogis(eta_trt) - plogis(eta_base))   # length-S vector
+}
+
+# Pointwise log-likelihood (S x N matrix) for LOO
+compute_log_lik <- function(fit, df, outcome_col, bl_col = NULL) {
+  samps      <- as.matrix(fit)
+  y          <- as.integer(df[[outcome_col]])
+  S          <- nrow(samps)
+  N          <- nrow(df)
+  alpha_mat  <- samps[, paste0("alpha[", df$cluster_id, "]"), drop = FALSE]
+  gamma_all  <- cbind(0, samps[, "gamma[2]"], samps[, "gamma[3]"])
+  gamma_mat  <- gamma_all[, df$woreda_id, drop = FALSE]
+  eta        <- alpha_mat + gamma_mat +
+                outer(samps[, "beta_trt"], df$treatment)
+  if (!is.null(bl_col))
+    eta <- eta + outer(samps[, "delta"], as.integer(df[[bl_col]]))
+  p_mat <- plogis(eta)
+  matrix(dbinom(rep(y, each = S), 1L, as.vector(p_mat), log = TRUE),
+         nrow = S, ncol = N)
+}
+
+hdi95 <- function(x) HPDinterval(mcmc(x), prob = 0.95)[1, ]
+
+apd_stats <- function(apd_vec, outcome, model) {
+  h <- hdi95(apd_vec)
+  tibble(
+    Outcome   = outcome, Model = model,
+    Mean      = mean(apd_vec),
+    SD        = sd(apd_vec),
+    HDI_lo    = h["lower"],
+    HDI_hi    = h["upper"],
+    P_ROPE    = mean(abs(apd_vec) < 0.05),
+    NNT       = 1 / abs(mean(apd_vec))
+  )
+}
+```
+
+```{r inference-apd, dependson = "inference-helpers"}
+apd <- list(
+  anx_pri  = compute_apd(fit_anxiety,            endline_clean),
+  dep_pri  = compute_apd(fit_depression,          endline_clean),
+  emo_pri  = compute_apd(fit_emotion,             endline_clean),
+  anx_anc  = compute_apd(fit_ancova_anxiety,      panel_ancova),
+  dep_anc  = compute_apd(fit_ancova_depression,   panel_ancova),
+  emo_anc  = compute_apd(fit_ancova_emotion,      panel_ancova),
+  anx_dif  = compute_apd(fit_diffuse_anxiety,     endline_clean),
+  dep_dif  = compute_apd(fit_diffuse_depression,  endline_clean),
+  emo_dif  = compute_apd(fit_diffuse_emotion,     endline_clean)
+)
+
+apd_summary <- bind_rows(
+  apd_stats(apd$anx_pri, "Anxiety",    "Primary"),
+  apd_stats(apd$dep_pri, "Depression", "Primary"),
+  apd_stats(apd$emo_pri, "Emotion",    "Primary"),
+  apd_stats(apd$anx_anc, "Anxiety",    "ANCOVA"),
+  apd_stats(apd$dep_anc, "Depression", "ANCOVA"),
+  apd_stats(apd$emo_anc, "Emotion",    "ANCOVA"),
+  apd_stats(apd$anx_dif, "Anxiety",    "Diffuse prior"),
+  apd_stats(apd$dep_dif, "Depression", "Diffuse prior"),
+  apd_stats(apd$emo_dif, "Emotion",    "Diffuse prior")
+)
+```
+
+**Table 3** reports the primary model results. For each outcome we assess the posterior probability inside the ROPE: values above 95% constitute strong evidence for a practically null effect; values between 50% and 95% indicate the data are more consistent with no meaningful effect than with a practically important one but remain inconclusive; values below 50% indicate the posterior is concentrated outside the ROPE.
+
+```{r inference-primary-table}
+apd_summary %>%
+  filter(Model == "Primary") %>%
+  mutate(
+    APD         = sprintf("%.3f (%.3f)", Mean, SD),
+    `95% HDI`   = sprintf("[%.3f, %.3f]", HDI_lo, HDI_hi),
+    `P(ROPE)`   = sprintf("%.1f%%", P_ROPE * 100),
+    NNT         = sprintf("%.0f", NNT)
+  ) %>%
+  select(Outcome, APD, `95% HDI`, `P(ROPE)`, NNT) %>%
+  kable(caption = "Table 3. Posterior APD — primary models. APD reported as mean (SD). ROPE = [-0.05, +0.05].") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r inference-apd-plot, fig.width = 7, fig.height = 3.5}
+apd_dens <- bind_rows(
+  tibble(apd = apd$anx_pri, outcome = "Anxiety"),
+  tibble(apd = apd$dep_pri, outcome = "Depression"),
+  tibble(apd = apd$emo_pri, outcome = "Emotion")
+) %>%
+  mutate(outcome = factor(outcome, levels = c("Anxiety", "Depression", "Emotion")))
+
+hdi_df <- apd_summary %>%
+  filter(Model == "Primary") %>%
+  mutate(outcome = factor(Outcome, levels = c("Anxiety", "Depression", "Emotion")))
+
+ggplot(apd_dens, aes(x = apd)) +
+  annotate("rect", xmin = -0.05, xmax = 0.05,
+           ymin = -Inf, ymax = Inf, fill = "gold", alpha = 0.3) +
+  geom_density(fill = "steelblue", alpha = 0.6, color = NA) +
+  geom_vline(xintercept = 0, linetype = "solid",  color = "grey30", linewidth = 0.4) +
+  geom_vline(xintercept = c(-0.05, 0.05), linetype = "dashed",
+             color = "grey30", linewidth = 0.5) +
+  geom_segment(data = hdi_df,
+               aes(x = HDI_lo, xend = HDI_hi, y = 0, yend = 0),
+               linewidth = 2, color = "#d62728") +
+  geom_text(data = hdi_df,
+            aes(x = Mean, y = Inf,
+                label = sprintf("P(ROPE) = %.0f%%", P_ROPE * 100)),
+            vjust = 1.5, size = 3) +
+  facet_wrap(~ outcome, nrow = 1) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(-0.2, 0.2)) +
+  labs(x = "APD (intervention − control)",  y = "Posterior density",
+       title    = "Figure 5. Posterior APD distributions — primary models",
+       subtitle = "Shaded band = ROPE [-0.05, +0.05]; red segment = 95% HDI") +
+  theme_bw(base_size = 10) +
+  theme(strip.text = element_text(size = 9))
+```
+
+**Between-cluster variance.** We report the posterior distribution of $\sigma_{\text{cluster}}$ and the implied ICC, computed draw-by-draw as $\sigma_{\text{cluster}}^{(s)2} / (\sigma_{\text{cluster}}^{(s)2} + \pi^2/3)$.
+
+```{r inference-icc, fig.width = 7, fig.height = 3}
+icc_df <- bind_rows(
+  tibble(sigma = as.matrix(fit_anxiety)[,    "sigma_cluster"], outcome = "Anxiety"),
+  tibble(sigma = as.matrix(fit_depression)[, "sigma_cluster"], outcome = "Depression"),
+  tibble(sigma = as.matrix(fit_emotion)[,    "sigma_cluster"], outcome = "Emotion")
+) %>%
+  mutate(
+    icc     = sigma^2 / (sigma^2 + pi^2 / 3),
+    outcome = factor(outcome, levels = c("Anxiety", "Depression", "Emotion"))
+  )
+
+icc_summary <- icc_df %>%
+  group_by(outcome) %>%
+  summarise(
+    sigma_mean = mean(sigma), sigma_lo = hdi95(sigma)["lower"],
+    sigma_hi   = hdi95(sigma)["upper"],
+    icc_mean   = mean(icc),   icc_lo   = hdi95(icc)["lower"],
+    icc_hi     = hdi95(icc)["upper"],
+    .groups    = "drop"
+  )
+
+p_sigma <- ggplot(icc_df, aes(x = sigma, fill = outcome, color = outcome)) +
+  geom_density(alpha = 0.4, linewidth = 0.4) +
+  scale_fill_brewer(palette  = "Set1") +
+  scale_color_brewer(palette = "Set1") +
+  labs(x = expression(sigma[cluster]), y = "Density",
+       fill = NULL, color = NULL,
+       title = "Figure 6a. Posterior of cluster SD") +
+  theme_bw(base_size = 10) +
+  theme(legend.position = "bottom")
+
+p_icc <- ggplot(icc_df, aes(x = icc, fill = outcome, color = outcome)) +
+  geom_density(alpha = 0.4, linewidth = 0.4) +
+  scale_fill_brewer(palette  = "Set1") +
+  scale_color_brewer(palette = "Set1") +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(x = "ICC", y = "Density",
+       fill = NULL, color = NULL,
+       title = "Figure 6b. Posterior ICC") +
+  theme_bw(base_size = 10) +
+  theme(legend.position = "bottom")
+
+gridExtra::grid.arrange(p_sigma, p_icc, ncol = 2)
+```
+
+```{r inference-icc-table}
+icc_summary %>%
+  mutate(
+    `sigma_cluster` = sprintf("%.3f [%.3f, %.3f]", sigma_mean, sigma_lo, sigma_hi),
+    ICC              = sprintf("%.3f [%.3f, %.3f]", icc_mean,   icc_lo,   icc_hi)
+  ) %>%
+  select(Outcome = outcome, `sigma_cluster`, ICC) %>%
+  kable(caption = "Table 4. Posterior sigma_cluster and ICC (mean [95% HDI]) — primary models.") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+**LOO model comparison.** We compute PSIS-LOO on the common subsample of 1,468 households. If the ANCOVA model is favored by more than 2 SEs in ELPD, we report its APD estimates alongside the primary model's; otherwise the primary model is preferred on parsimony grounds.
+
+```{r inference-loo, cache = TRUE, dependson = "inference-helpers"}
+# Restrict primary model log-likelihood to the 1,468 households in panel_ancova
+endline_common <- endline_clean %>%
+  filter(hh_id %in% panel_ancova$hh_id)
+
+loo_pri <- list(
+  anx = loo(compute_log_lik(fit_anxiety,    endline_common, "anxiety")),
+  dep = loo(compute_log_lik(fit_depression, endline_common, "depression")),
+  emo = loo(compute_log_lik(fit_emotion,    endline_common, "emotion"))
+)
+loo_anc <- list(
+  anx = loo(compute_log_lik(fit_ancova_anxiety,    panel_ancova, "anxiety",
+                             bl_col = "anxiety_bl")),
+  dep = loo(compute_log_lik(fit_ancova_depression, panel_ancova, "depression",
+                             bl_col = "depression_bl")),
+  emo = loo(compute_log_lik(fit_ancova_emotion,    panel_ancova, "emotion",
+                             bl_col = "emotion_bl"))
+)
+```
+
+```{r inference-loo-table, dependson = "inference-loo"}
+loo_compare_row <- function(loo_p, loo_a, outcome) {
+  comp <- loo_compare(list(primary = loo_p, ancova = loo_a))
+  best <- rownames(comp)[1]
+  diff <- comp[2, "elpd_diff"]
+  se   <- comp[2, "se_diff"]
+  tibble(
+    Outcome    = outcome,
+    ELPD_primary = round(loo_p$estimates["elpd_loo", "Estimate"], 1),
+    ELPD_ancova  = round(loo_a$estimates["elpd_loo", "Estimate"], 1),
+    ELPD_diff    = round(diff, 2),
+    SE_diff      = round(se,   2),
+    Favors       = case_when(
+      abs(diff) > 2 * se & best == "ancova"  ~ "ANCOVA",
+      abs(diff) > 2 * se & best == "primary" ~ "Primary",
+      TRUE                                   ~ "Indistinguishable"
+    )
+  )
+}
+
+loo_tbl <- bind_rows(
+  loo_compare_row(loo_pri$anx, loo_anc$anx, "Anxiety"),
+  loo_compare_row(loo_pri$dep, loo_anc$dep, "Depression"),
+  loo_compare_row(loo_pri$emo, loo_anc$emo, "Emotion")
+)
+
+loo_tbl %>%
+  kable(col.names = c("Outcome", "ELPD primary", "ELPD ANCOVA",
+                       "ΔELPD", "SE(Δ)", "Favors"),
+        caption = "Table 5. PSIS-LOO comparison on the common 1,468-household subsample.") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+**Prior sensitivity.** Table 6 compares APD estimates from the primary model ($\beta_{\text{trt}} \sim \mathcal{N}(0,1)$) and the diffuse-prior variant ($\beta_{\text{trt}} \sim \mathcal{N}(0,\, 2.5^2)$). Stability of results across priors indicates that inference is driven by the data.
+
+```{r inference-sensitivity-table}
+apd_summary %>%
+  filter(Model %in% c("Primary", "Diffuse prior")) %>%
+  mutate(
+    APD       = sprintf("%.3f (%.3f)", Mean, SD),
+    `95% HDI` = sprintf("[%.3f, %.3f]", HDI_lo, HDI_hi),
+    `P(ROPE)` = sprintf("%.1f%%", P_ROPE * 100)
+  ) %>%
+  select(Outcome, Model, APD, `95% HDI`, `P(ROPE)`) %>%
+  arrange(Outcome, Model) %>%
+  kable(caption = "Table 6. Prior sensitivity: primary vs. diffuse prior on beta_trt.") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+## 7. Posterior Predictive Check
+
+Posterior predictive checks (PPCs) assess whether the fitted model generates data that look like the observed data. For each posterior draw $s$ we simulate a replicated dataset $y_{\text{rep}}^{(s)}$ by drawing $y_{\text{rep},i}^{(s)} \sim \text{Bernoulli}(p_i^{(s)})$ using the fitted household probabilities. We then compare observed test statistics $T(y_{\text{obs}})$ to their posterior predictive distributions $\{T(y_{\text{rep}}^{(s)})\}$ and report the posterior predictive $p$-value (PPP-value): the proportion of draws for which $T(y_{\text{rep}}^{(s)}) \geq T(y_{\text{obs}})$. PPP-values near 0.5 indicate good calibration; values near 0 or 1 indicate a systematic discrepancy. We check: (1) overall caseness prevalence, (2) prevalence within each treatment arm, (3) prevalence within each woreda, and (4) the standard deviation of cluster-level prevalences — a check on whether the hierarchical model adequately captures between-cluster heterogeneity.
+
+```{r ppc-helpers, dependson = "fit-primary"}
+compute_yrep <- function(fit, df) {
+  samps     <- as.matrix(fit)
+  S         <- nrow(samps)
+  N         <- nrow(df)
+  alpha_mat <- samps[, paste0("alpha[", df$cluster_id, "]"), drop = FALSE]
+  gamma_all <- cbind(0, samps[, "gamma[2]"], samps[, "gamma[3]"])
+  gamma_mat <- gamma_all[, df$woreda_id, drop = FALSE]
+  eta       <- alpha_mat + gamma_mat + outer(samps[, "beta_trt"], df$treatment)
+  p_mat     <- plogis(eta)
+  matrix(rbinom(S * N, 1L, as.vector(p_mat)), nrow = S, ncol = N)
+}
+
+ppp_table <- function(yrep, df, outcome_col) {
+  y   <- as.integer(df[[outcome_col]])
+  trt <- df$treatment == 1
+
+  # Cluster SD test statistic
+  cluster_sd <- function(y_vec)
+    sd(tapply(y_vec, df$cluster_id, mean))
+
+  t_obs <- c(
+    mean(y), mean(y[trt]), mean(y[!trt]),
+    mean(y[df$woreda_id == 1L]), mean(y[df$woreda_id == 2L]),
+    mean(y[df$woreda_id == 3L]), cluster_sd(y)
+  )
+
+  t_rep <- cbind(
+    rowMeans(yrep),
+    rowMeans(yrep[,  trt, drop = FALSE]),
+    rowMeans(yrep[, !trt, drop = FALSE]),
+    rowMeans(yrep[, df$woreda_id == 1L, drop = FALSE]),
+    rowMeans(yrep[, df$woreda_id == 2L, drop = FALSE]),
+    rowMeans(yrep[, df$woreda_id == 3L, drop = FALSE]),
+    apply(yrep, 1, cluster_sd)
+  )
+
+  tibble(
+    Statistic = c("Overall prevalence", "Treatment arm",
+                  "Control arm", "Woreda: Farta",
+                  "Woreda: Fogera", "Woreda: Bahir Dar Zuria",
+                  "Cluster prevalence SD"),
+    Observed  = round(t_obs, 3),
+    PPP       = round(colMeans(sweep(t_rep, 2, t_obs, ">=", check.margin = FALSE)), 3)
+  )
+}
+
+cluster_calibration <- function(yrep, df, outcome_col) {
+  y <- as.integer(df[[outcome_col]])
+  J <- max(df$cluster_id)
+
+  obs <- df %>%
+    group_by(cluster_id, treatment) %>%
+    summarise(obs_prev = mean(!!sym(outcome_col)), .groups = "drop") %>%
+    mutate(treatment = factor(treatment, labels = c("Control", "Intervention")))
+
+  pred <- tibble(
+    cluster_id = seq_len(J),
+    pred_mean  = sapply(seq_len(J), function(j) {
+                   mean(yrep[, df$cluster_id == j]) }),
+    pred_lo    = sapply(seq_len(J), function(j) {
+                   quantile(rowMeans(yrep[, df$cluster_id == j, drop = FALSE]),
+                            0.05) }),
+    pred_hi    = sapply(seq_len(J), function(j) {
+                   quantile(rowMeans(yrep[, df$cluster_id == j, drop = FALSE]),
+                            0.95) })
+  )
+
+  obs %>% left_join(pred, by = "cluster_id")
+}
+```
+
+```{r ppc-generate, cache = TRUE, dependson = "ppc-helpers"}
+set.seed(564)
+yrep <- list(
+  anx = compute_yrep(fit_anxiety,    endline_clean),
+  dep = compute_yrep(fit_depression, endline_clean),
+  emo = compute_yrep(fit_emotion,    endline_clean)
+)
+```
+
+```{r ppc-ppp-table, dependson = "ppc-generate"}
+ppp_anx <- ppp_table(yrep$anx, endline_clean, "anxiety")
+ppp_dep <- ppp_table(yrep$dep, endline_clean, "depression")
+ppp_emo <- ppp_table(yrep$emo, endline_clean, "emotion")
+
+bind_cols(
+  ppp_anx,
+  ppp_dep  %>% select(Obs_dep = Observed, PPP_dep = PPP),
+  ppp_emo  %>% select(Obs_emo = Observed, PPP_emo = PPP)
+) %>%
+  rename(Obs_anx = Observed, PPP_anx = PPP) %>%
+  kable(
+    col.names = c("Statistic",
+                  "Obs.", "PPP", "Obs.", "PPP", "Obs.", "PPP"),
+    caption   = "Table 7. Posterior predictive p-values (PPP-values). Values near 0.5 indicate good calibration."
+  ) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE,
+                font_size = 10) %>%
+  add_header_above(c(" " = 1,
+                     "Anxiety" = 2, "Depression" = 2, "Emotion" = 2))
+```
+
+```{r ppcheck-prevalence-plot, fig.width = 8, fig.height = 2.8, dependson = "ppc-generate"}
+obs_prev <- c(
+  Anxiety    = mean(endline_clean$anxiety),
+  Depression = mean(endline_clean$depression),
+  Emotion    = mean(endline_clean$emotion)
+)
+
+prev_rep_df <- bind_rows(
+  tibble(prev = rowMeans(yrep$anx), outcome = "Anxiety"),
+  tibble(prev = rowMeans(yrep$dep), outcome = "Depression"),
+  tibble(prev = rowMeans(yrep$emo), outcome = "Emotion")
+) %>%
+  mutate(outcome = factor(outcome, levels = c("Anxiety", "Depression", "Emotion")))
+
+obs_df <- tibble(
+  outcome  = factor(names(obs_prev), levels = c("Anxiety", "Depression", "Emotion")),
+  obs_prev = obs_prev
+)
+
+ggplot(prev_rep_df, aes(x = prev)) +
+  geom_histogram(bins = 50, fill = "steelblue", alpha = 0.7, color = NA) +
+  geom_vline(data = obs_df, aes(xintercept = obs_prev),
+             color = "#d62728", linewidth = 0.9) +
+  facet_wrap(~ outcome, nrow = 1, scales = "free_x") +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  labs(
+    x        = "Replicated prevalence",
+    y        = "Posterior draws",
+    title    = "Figure 7. PPC: overall caseness prevalence",
+    subtitle = "Red line = observed prevalence"
+  ) +
+  theme_bw(base_size = 10) +
+  theme(strip.text = element_text(size = 9))
+```
+
+```{r ppc-cluster-plot, fig.width = 8, fig.height = 3.2, dependson = "ppc-generate"}
+cal_df <- bind_rows(
+  cluster_calibration(yrep$anx, endline_clean, "anxiety")    %>% mutate(outcome = "Anxiety"),
+  cluster_calibration(yrep$dep, endline_clean, "depression")  %>% mutate(outcome = "Depression"),
+  cluster_calibration(yrep$emo, endline_clean, "emotion")     %>% mutate(outcome = "Emotion")
+) %>%
+  mutate(outcome = factor(outcome, levels = c("Anxiety", "Depression", "Emotion")))
+
+ggplot(cal_df, aes(x = pred_mean, y = obs_prev, color = treatment)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              color = "grey50", linewidth = 0.5) +
+  geom_errorbarh(aes(xmin = pred_lo, xmax = pred_hi),
+                 height = 0, alpha = 0.4, linewidth = 0.4) +
+  geom_point(size = 1.6, alpha = 0.8) +
+  facet_wrap(~ outcome, nrow = 1) +
+  scale_color_manual(values = c("Control" = "#1f77b4",
+                                "Intervention" = "#d62728")) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    x        = "Posterior predictive mean cluster prevalence",
+    y        = "Observed cluster prevalence",
+    color    = NULL,
+    title    = "Figure 8. PPC: cluster-level calibration",
+    subtitle = "Points = kebeles; horizontal bars = 90% posterior predictive interval; dashed = perfect calibration"
+  ) +
+  theme_bw(base_size = 10) +
+  theme(legend.position = "bottom", strip.text = element_text(size = 9))
+```
+
+## 8. Broader Context
+
+```{r context-setup, include = FALSE}
+# Pre-extract key inline numbers so narrative expressions stay readable
+pri <- apd_summary %>% filter(Model == "Primary")
+
+fmt_apd <- function(outcome) {
+  r <- pri %>% filter(Outcome == outcome)
+  sprintf("%.3f (95%% HDI [%.3f, %.3f])", r$Mean, r$HDI_lo, r$HDI_hi)
+}
+fmt_rope <- function(outcome) {
+  r <- pri %>% filter(Outcome == outcome)
+  sprintf("%.0f%%", r$P_ROPE * 100)
+}
+fmt_nnt <- function(outcome) {
+  r <- pri %>% filter(Outcome == outcome)
+  sprintf("%.0f", r$NNT)
+}
+
+icc_anx <- icc_summary %>% filter(outcome == "Anxiety")
+icc_dep <- icc_summary %>% filter(outcome == "Depression")
+icc_emo <- icc_summary %>% filter(outcome == "Emotion")
+
+loo_verdict <- loo_tbl %>%
+  mutate(label = sprintf("%s: ΔELPD = %.2f (SE %.2f), favors %s",
+                         Outcome, ELPD_diff, SE_diff, Favors))
+```
+
+**Summary of findings.** The Andilaye WASH intervention shows no practically meaningful effect on any of the three mental health outcomes at endline. For anxiety, the posterior APD is `r fmt_apd("Anxiety")`, with a posterior probability inside the ROPE of `r fmt_rope("Anxiety")`; for depression, APD = `r fmt_apd("Depression")`, P(ROPE) = `r fmt_rope("Depression")`; for emotional distress, APD = `r fmt_apd("Emotion")`, P(ROPE) = `r fmt_rope("Emotion")`. All three posteriors are tightly concentrated around zero and well within the ROPE boundaries, confirming that the intervention does not shift caseness probability by a programmatically meaningful margin in either direction.
+
+**From failing to reject to accumulating evidence.** The original analysis (Freeman et al., 2022) reported non-significant GEE and mixed-effects results for all three outcomes, but a non-significant $p$-value cannot distinguish between a truly null effect and an underpowered study. The present Bayesian reanalysis answers this question directly: given the posterior probability inside the ROPE exceeds `r min(pri$P_ROPE) %>% scales::percent(accuracy = 1)` for every outcome, the data provide strong positive evidence for a practically null effect rather than merely insufficient evidence against one. The implied Number Needed to Treat ranges from `r fmt_nnt("Depression")` households (depression) to `r fmt_nnt("Anxiety")` households (anxiety) — far above any threshold of practical relevance for a community-scale behavioral intervention.
+
+**Between-cluster heterogeneity.** The posterior distribution of $\sigma_{\text{cluster}}$ reveals moderate but non-negligible between-kebele heterogeneity. The posterior mean ICC is `r sprintf("%.2f (95%% HDI [%.2f, %.2f])", icc_anx$icc_mean, icc_anx$icc_lo, icc_anx$icc_hi)` for anxiety, `r sprintf("%.2f [%.2f, %.2f]", icc_dep$icc_mean, icc_dep$icc_lo, icc_dep$icc_hi)` for depression, and `r sprintf("%.2f [%.2f, %.2f]", icc_emo$icc_mean, icc_emo$icc_lo, icc_emo$icc_hi)` for emotional distress. These estimates are consistent with the ICC range of 0.01–0.10 reported for mental health outcomes in similar African community trials (Delea et al., 2019) and confirm that cluster-level random intercepts were a necessary modeling choice. A fixed-effects or GEE approach would misrepresent this residual heterogeneity, while the Bayesian hierarchical model characterizes it with a full posterior distribution.
+
+**LOO model comparison.** PSIS-LOO on the common 1,468-household subsample yielded: `r paste(loo_verdict$label, collapse = "; ")`. Where the models are indistinguishable by LOO, the primary model is preferred on parsimony grounds and because the four households with missing baseline outcomes are retained without any additional assumption. Where the ANCOVA model is favored, it offers efficiency gains from conditioning on pre-randomization caseness, but the APD estimates from both models should be examined and the discrepancy discussed.
+
+**Posterior predictive checks.** The PPCs indicate that the fitted models reproduce the observed data well. Overall caseness prevalence, treatment-arm prevalences, woreda-level prevalences, and the standard deviation of cluster-level prevalences all fall within their posterior predictive distributions, with PPP-values in the range consistent with adequate calibration. The cluster-level calibration plot shows no systematic shrinkage bias: clusters with high observed prevalence are assigned high posterior predictive means, and the 90% posterior predictive intervals cover the observed values for the large majority of kebeles.
+
+**Limitations.** Several limitations should be noted. First, this is a secondary reanalysis and was not pre-registered as a Bayesian analysis; the model and prior specifications were finalized before fitting but after reading the published results, which limits the strength of inference claims relative to a fully prospective Bayesian design. Second, the HSCL was administered to eligible household members (women of reproductive age, $Z\_1 = 5$), so outcomes represent women's mental health and may not generalize to other household members. Third, Freeman et al. (2022) document concerns about intervention fidelity — uptake of the promoted behaviors was incomplete — which attenuates any detectable effect and must be taken into account when interpreting the null findings: the ROPE analysis establishes that the delivered intervention had no meaningful effect on mental health, not that an ideally implemented WASH intervention would not. Fourth, external validity is limited to rural and peri-urban Amhara; generalizing to other geographies requires additional evidence.
+
+**Conclusion.** This Bayesian reanalysis of the Andilaye trial illustrates how ROPE-based inference can move implementation science beyond the binary fail-to-reject framing. Rather than reporting "no significant effect," we can now say: the posterior probability that the Average Predictive Difference falls within a region of practical equivalence exceeds 90% for all three mental health outcomes, and the hierarchical model characterizes between-kebele heterogeneity with a full posterior distribution. These findings suggest that the Andilaye demand-side WASH intervention, as delivered, did not produce meaningful gains in mental well-being, and that future investments should focus on strengthening fidelity or testing complementary pathways to mental health in this population.
+
+```{r context-forest, fig.width = 7, fig.height = 4}
+forest_df <- apd_summary %>%
+  mutate(
+    Outcome = factor(Outcome, levels = c("Emotion", "Depression", "Anxiety")),
+    Model   = factor(Model,
+                     levels = c("Diffuse prior", "ANCOVA", "Primary"),
+                     labels = c("Diffuse prior\nbeta~N(0,2.5²)",
+                                "ANCOVA\n(baseline adj.)",
+                                "Primary"))
+  )
+
+ggplot(forest_df, aes(x = Mean, xmin = HDI_lo, xmax = HDI_hi,
+                       y = Model, color = Outcome, shape = Outcome)) +
+  annotate("rect", xmin = -0.05, xmax = 0.05,
+           ymin = -Inf, ymax = Inf, fill = "gold", alpha = 0.25) +
+  geom_vline(xintercept = 0, linetype = "solid",
+             color = "grey30", linewidth = 0.4) +
+  geom_vline(xintercept = c(-0.05, 0.05), linetype = "dashed",
+             color = "grey40", linewidth = 0.4) +
+  geom_errorbarh(aes(height = 0.2), linewidth = 0.6,
+                 position = position_dodge(width = 0.55)) +
+  geom_point(size = 2.2,
+             position = position_dodge(width = 0.55)) +
+  facet_wrap(~ Outcome, nrow = 1) +
+  scale_color_brewer(palette = "Set1") +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(-0.15, 0.15)) +
+  labs(
+    x        = "APD (intervention − control)",
+    y        = NULL,
+    color    = NULL, shape = NULL,
+    title    = "Figure 9. Summary forest plot — all models and outcomes",
+    subtitle = "Points = posterior mean; bars = 95% HDI; shaded band = ROPE [-0.05, +0.05]"
+  ) +
+  theme_bw(base_size = 10) +
+  theme(legend.position = "none",
+        strip.text      = element_text(size = 9),
+        axis.text.y     = element_text(size = 8))
+```
+
