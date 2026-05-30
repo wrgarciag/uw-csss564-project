@@ -1111,3 +1111,257 @@ ggplot(forest_df, aes(x = Mean, xmin = HDI_lo, xmax = HDI_hi,
         axis.text.y     = element_text(size = 8))
 ```
 
+
+## Appendix: Sensitivity Analysis — Substantively Informed Priors
+
+The primary analysis uses deliberately weakly informative priors — $\mu_0 \sim \mathcal{N}(0, 1^2)$ and $\sigma_{\text{cluster}} \sim \text{Half-}t(3, 0, 2.5)$ — chosen to let the data dominate and to remain credible to a skeptical reader. A complementary question is whether the conclusions survive when the priors are instead anchored to substantive knowledge about this trial and this literature. This appendix repeats the entire pipeline under a *substantively informed* prior specification and compares the resulting APD posteriors to the primary model. The treatment and woreda priors are left unchanged so that any movement in the estimands is attributable solely to the two structural priors we deliberately tighten.
+
+**Motivation for the grand-mean prior $\mu_0 \sim \mathcal{N}(-1.1, 0.5^2)$.** In the primary model $\mu_0$ — the grand-mean log-odds of caseness across kebeles — is given a unit-Normal prior, which on the probability scale spans almost the entire $(0, 1)$ interval and is agnostic about whether caseness is rare or common. We have direct knowledge that it is not common: the observed baseline caseness rates in the Andilaye trial sit around one in four households. Centering $\mu_0$ at $-1.1$ encodes exactly this, because $\text{logit}^{-1}(-1.1) \approx `r round(plogis(-1.1), 3)`$ — a grand-mean prevalence of roughly 25%. The scale of $0.5$ keeps the prior honest rather than dogmatic: a $\pm 1.96\,\sigma$ interval runs from $\text{logit}^{-1}(-2.08) \approx 0.11$ to $\text{logit}^{-1}(-0.12) \approx 0.47$, so the prior comfortably accommodates prevalences anywhere from about 11% to 47% while ruling out the implausible near-0% and near-100% regions that the unit-Normal prior leaves open.
+
+**Motivation for the cluster-SD prior $\sigma_{\text{cluster}} \sim \text{Half-}\mathcal{N}(0, 0.5^2)$.** The primary $\text{Half-}t(3, 0, 2.5)$ prior follows Gelman (2006): it is heavy-tailed (only 3 degrees of freedom) and has a large scale (2.5), so it places non-trivial mass on very large between-kebele heterogeneity, with cluster standard deviations plausibly exceeding 2 or 3 on the log-odds scale and an implied ICC that can approach 1. The substantively informed alternative replaces this with a Half-Normal whose thin Gaussian tail and small scale (0.5) concentrate the prior near modest heterogeneity. Its median cluster SD is $0.5 \times \Phi^{-1}(0.75) \approx `r round(0.5 * qnorm(0.75), 3)`$, which translates — via $\text{ICC} = \sigma^2 / (\sigma^2 + \pi^2/3)$ — to a **prior ICC median of $\approx `r round((0.5*qnorm(0.75))^2 / ((0.5*qnorm(0.75))^2 + pi^2/3), 3)`$**. This sits squarely in the middle of the 0.01–0.10 ICC range reported for mental-health outcomes in African community-based trials (Delea et al., 2019), and is far more concentrated than the primary prior precisely because the Half-Normal lacks the heavy $t_3$ tail and uses one-fifth of the scale, so it does not entertain the large-ICC scenarios the primary prior must hedge against.
+
+**These priors constitute a sensitivity analysis, not a replacement.** The informed priors deliberately import external information — observed baseline prevalence and the published clustering literature — that the primary model holds at arm's length. That makes them appropriate as a *robustness probe* rather than as the headline specification: if the substantive priors and the deliberately neutral priors yield the same qualitative answer, the conclusion is shown to be insensitive to a defensible tightening of the structural priors and therefore data-driven rather than prior-driven. The primary model remains the reference analysis because its weak priors make the fewest assumptions and are the most persuasive to a skeptical audience; this appendix simply demonstrates that those assumptions were not load-bearing.
+
+### A. Informed-prior JAGS model string
+
+```{r app-informed-model}
+# Substantively informed prior specification. Only the two structural priors
+# change relative to model_string_primary:
+#   mu0           ~ dnorm(0, 1)            -> dnorm(-1.1, pow(0.5, -2))
+#   sigma_cluster ~ dt(0, pow(2.5,-2), 3) T(0,) -> dnorm(0, pow(0.5,-2)) T(0,)
+# beta_trt and gamma[2:3] are left at N(0, 1) exactly as in the primary model.
+model_string_informed <- "
+model {
+  for (i in 1:N) {
+    y[i] ~ dbern(p[i])
+    logit(p[i]) <- alpha[cluster[i]] + beta_trt * trt[i] + gamma[woreda[i]]
+  }
+  for (j in 1:J) {
+    alpha[j] ~ dnorm(mu0, tau_cluster)
+  }
+  beta_trt      ~ dnorm(0, 1)
+  gamma[1]      <- 0
+  for (k in 2:3) {
+    gamma[k]    ~ dnorm(0, 1)
+  }
+  mu0           ~ dnorm(-1.1, pow(0.5, -2))
+  sigma_cluster ~ dnorm(0, pow(0.5, -2)) T(0, )
+  tau_cluster   <- pow(sigma_cluster, -2)
+}
+"
+```
+
+### B. Prior predictive check under the informed priors
+
+We repeat the prior predictive simulation of Section 3 ($S = 1{,}000$ draws) using the informed priors. The simulation reuses the observed design (cluster, woreda, and treatment vectors of `endline_clean`); only the parameter-generating distributions change.
+
+```{r app-ppc-draws}
+set.seed(564)
+S_app <- 1000L
+
+N_app       <- nrow(endline_clean)
+cluster_idx <- endline_clean$cluster_id
+woreda_idx  <- endline_clean$woreda_id
+trt_vec     <- endline_clean$treatment
+
+prev_inf  <- numeric(S_app)
+apd_inf_p <- numeric(S_app)
+sigma_inf <- numeric(S_app)
+icc_inf   <- numeric(S_app)
+
+for (s in seq_len(S_app)) {
+  mu0           <- rnorm(1, -1.1, 0.5)        # N(-1.1, 0.5^2)
+  sigma_cluster <- abs(rnorm(1, 0, 0.5))      # Half-Normal(0, 0.5^2)
+  alpha         <- rnorm(50L, mu0, sigma_cluster)
+  beta_trt      <- rnorm(1, 0, 1)             # unchanged
+  gamma         <- c(0, rnorm(2, 0, 1))       # unchanged
+
+  eta   <- alpha[cluster_idx] + beta_trt * trt_vec + gamma[woreda_idx]
+  y_sim <- rbinom(N_app, 1L, plogis(eta))
+
+  p_trt  <- plogis(alpha[cluster_idx] + beta_trt + gamma[woreda_idx])
+  p_ctrl <- plogis(alpha[cluster_idx]            + gamma[woreda_idx])
+
+  prev_inf[s]  <- mean(y_sim)
+  apd_inf_p[s] <- mean(p_trt - p_ctrl)
+  sigma_inf[s] <- sigma_cluster
+  icc_inf[s]   <- sigma_cluster^2 / (sigma_cluster^2 + pi^2 / 3)
+}
+
+ppc_inf_draws <- tibble(prev = prev_inf, apd = apd_inf_p,
+                        sigma = sigma_inf, icc = icc_inf)
+```
+
+```{r app-ppc-prevalence, fig.width = 6, fig.height = 3.5}
+obs_prev_app <- tibble(
+  outcome = c("Depression", "Anxiety", "Emotional distress"),
+  prev    = c(mean(endline_clean$depression), mean(endline_clean$anxiety),
+              mean(endline_clean$emotion))
+)
+
+ggplot(ppc_inf_draws, aes(x = prev)) +
+  geom_histogram(bins = 60, fill = "steelblue", alpha = 0.7, color = NA) +
+  geom_vline(data = obs_prev_app,
+             aes(xintercept = prev, linetype = outcome, color = outcome),
+             linewidth = 0.8) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(0, 1)) +
+  scale_color_manual(values = c("Depression"         = "#d62728",
+                                "Anxiety"            = "#2ca02c",
+                                "Emotional distress" = "#9467bd")) +
+  scale_linetype_manual(values = c("Depression"         = "solid",
+                                   "Anxiety"            = "dashed",
+                                   "Emotional distress" = "dotted")) +
+  labs(x = "Sample caseness prevalence", y = "Prior predictive draws",
+       color = NULL, linetype = NULL,
+       title    = "Figure A1. Prior predictive prevalence (informed priors)",
+       subtitle = "Vertical lines mark observed endline prevalences") +
+  theme_bw(base_size = 10) +
+  theme(legend.position = "bottom")
+```
+
+```{r app-ppc-apd, fig.width = 6, fig.height = 3.5}
+rope_prob_inf <- mean(abs(ppc_inf_draws$apd) < 0.05)
+
+ggplot(ppc_inf_draws, aes(x = apd)) +
+  annotate("rect", xmin = -0.05, xmax = 0.05, ymin = -Inf, ymax = Inf,
+           fill = "gold", alpha = 0.3) +
+  geom_histogram(bins = 80, fill = "steelblue", alpha = 0.7, color = NA) +
+  geom_vline(xintercept = c(-0.05, 0.05), linetype = "dashed", linewidth = 0.7) +
+  geom_vline(xintercept = 0, linetype = "solid", linewidth = 0.4, color = "grey40") +
+  annotate("text", x = 0, y = Inf, vjust = 1.5,
+           label = sprintf("Prior P(APD in ROPE) = %.0f%%", rope_prob_inf * 100),
+           size = 3.5) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(x = "Average Predictive Difference (APD)", y = "Prior predictive draws",
+       title    = "Figure A2. Prior predictive APD (informed priors)",
+       subtitle = "Shaded band = ROPE [-0.05, +0.05]") +
+  theme_bw(base_size = 10)
+```
+
+```{r app-ppc-sigma, fig.width = 6, fig.height = 3.5}
+ggplot(ppc_inf_draws, aes(x = sigma)) +
+  geom_histogram(bins = 60, fill = "steelblue", alpha = 0.7, color = NA) +
+  geom_vline(xintercept = median(ppc_inf_draws$sigma),
+             linetype = "dashed", color = "grey30", linewidth = 0.7) +
+  annotate("text", x = median(ppc_inf_draws$sigma), y = Inf, hjust = -0.1, vjust = 1.5,
+           label = sprintf("median = %.2f", median(ppc_inf_draws$sigma)), size = 3.5) +
+  labs(x = expression(sigma[cluster]), y = "Prior predictive draws",
+       title    = "Figure A3. Prior predictive cluster SD (informed priors)",
+       subtitle = expression("Half-Normal(0, 0.5"^2*")")) +
+  theme_bw(base_size = 10)
+```
+
+```{r app-ppc-icc, fig.width = 6, fig.height = 3.5}
+ggplot(ppc_inf_draws, aes(x = icc)) +
+  geom_histogram(bins = 60, fill = "steelblue", alpha = 0.7, color = NA) +
+  geom_vline(xintercept = median(ppc_inf_draws$icc),
+             linetype = "dashed", color = "grey30", linewidth = 0.7) +
+  annotate("text", x = median(ppc_inf_draws$icc), y = Inf, hjust = -0.1, vjust = 1.5,
+           label = sprintf("median = %.3f", median(ppc_inf_draws$icc)), size = 3.5) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(x = "Implied ICC", y = "Prior predictive draws",
+       title    = "Figure A4. Prior predictive ICC (informed priors)",
+       subtitle = "Concentrated near 0.034, vs. the diffuse primary Half-t(3, 0, 2.5)") +
+  theme_bw(base_size = 10)
+```
+
+The informed prior reproduces the intended structure: predicted prevalence (Figure A1) is concentrated around 25% and brackets all three observed endline rates; the prior APD (Figure A2) remains centered at zero, so the ROPE analysis is not pre-judged; and the cluster-SD and ICC priors (Figures A3–A4) are tightly concentrated, with an ICC median near 0.034 rather than the much broader spread of the primary prior.
+
+### C. Model fitting under the informed priors
+
+The three primary outcomes are re-fit under `model_string_informed` using the identical MCMC configuration as the primary analysis (`r n_chains` chains, `r n_adapt` adapt, `r n_burnin` burn-in, `r n_iter` iterations, thin = `r n_thin`) via the existing `fit_jags()` helper. We use seed offsets distinct from those already used in the document to keep the chains independent.
+
+```{r app-fit, cache = TRUE, dependson = "mcmc-settings"}
+set.seed(564)
+fit_inf_anxiety    <- fit_jags(model_string_informed, jags_data_anxiety,    params_primary,  9L)
+fit_inf_depression <- fit_jags(model_string_informed, jags_data_depression, params_primary, 10L)
+fit_inf_emotion    <- fit_jags(model_string_informed, jags_data_emotion,    params_primary, 11L)
+```
+
+### D. Results under the informed priors
+
+We compute the APD, 95% HDI, posterior probability inside the ROPE, and NNT for each outcome using the same `compute_apd()` and `apd_stats()` helpers defined in Section 6.
+
+```{r app-results}
+set.seed(564)
+apd_inf <- list(
+  anx = compute_apd(fit_inf_anxiety,    endline_clean),
+  dep = compute_apd(fit_inf_depression, endline_clean),
+  emo = compute_apd(fit_inf_emotion,    endline_clean)
+)
+
+informed_summary <- bind_rows(
+  apd_stats(apd_inf$anx, "Anxiety",    "Informed"),
+  apd_stats(apd_inf$dep, "Depression", "Informed"),
+  apd_stats(apd_inf$emo, "Emotion",    "Informed")
+)
+
+informed_summary %>%
+  mutate(
+    APD       = sprintf("%.3f (%.3f)", Mean, SD),
+    `95% HDI` = sprintf("[%.3f, %.3f]", HDI_lo, HDI_hi),
+    `P(ROPE)` = sprintf("%.1f%%", P_ROPE * 100),
+    NNT       = sprintf("%.0f", NNT)
+  ) %>%
+  select(Outcome, APD, `95% HDI`, `P(ROPE)`, NNT) %>%
+  kable(caption = "Table A1. Posterior APD under substantively informed priors. APD reported as mean (SD). ROPE = [-0.05, +0.05].") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+### E. Comparison with the primary model
+
+Figure A5 places the informed-prior APD posteriors side by side with the primary-model posteriors (reusing `apd_summary` from Section 6) for each outcome, on the same ROPE band and visual theme as Figure 9.
+
+```{r app-forest, fig.width = 7, fig.height = 4}
+forest_app <- bind_rows(
+  apd_summary %>% filter(Model == "Primary") %>%
+    select(Outcome, Model, Mean, HDI_lo, HDI_hi, P_ROPE),
+  informed_summary %>%
+    select(Outcome, Model, Mean, HDI_lo, HDI_hi, P_ROPE)
+) %>%
+  mutate(
+    Outcome = factor(Outcome, levels = c("Emotion", "Depression", "Anxiety")),
+    Model   = factor(Model, levels = c("Informed", "Primary"),
+                     labels = c("Informed\n(substantive)", "Primary"))
+  )
+
+ggplot(forest_app, aes(x = Mean, xmin = HDI_lo, xmax = HDI_hi,
+                       y = Model, color = Outcome, shape = Outcome)) +
+  annotate("rect", xmin = -0.05, xmax = 0.05,
+           ymin = -Inf, ymax = Inf, fill = "gold", alpha = 0.25) +
+  geom_vline(xintercept = 0, linetype = "solid",
+             color = "grey30", linewidth = 0.4) +
+  geom_vline(xintercept = c(-0.05, 0.05), linetype = "dashed",
+             color = "grey40", linewidth = 0.4) +
+  geom_errorbarh(aes(height = 0.2), linewidth = 0.6) +
+  geom_point(size = 2.2) +
+  facet_wrap(~ Outcome, nrow = 1) +
+  scale_color_brewer(palette = "Set1") +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(-0.15, 0.15)) +
+  labs(
+    x        = "APD (intervention − control)",
+    y        = NULL,
+    color    = NULL, shape = NULL,
+    title    = "Figure A5. APD comparison: primary vs. substantively informed priors",
+    subtitle = "Points = posterior mean; bars = 95% HDI; shaded band = ROPE [-0.05, +0.05]"
+  ) +
+  theme_bw(base_size = 10) +
+  theme(legend.position = "none",
+        strip.text      = element_text(size = 9),
+        axis.text.y     = element_text(size = 8))
+```
+
+```{r app-conclusion-setup, include = FALSE}
+# Pre-extract paired primary/informed numbers for the narrative below
+prim_pri <- apd_summary %>% filter(Model == "Primary")
+cmp <- informed_summary %>%
+  select(Outcome, inf_mean = Mean, inf_rope = P_ROPE) %>%
+  left_join(prim_pri %>% select(Outcome, pri_mean = Mean, pri_rope = P_ROPE),
+            by = "Outcome")
+max_apd_shift  <- max(abs(cmp$inf_mean - cmp$pri_mean))
+min_rope_inf   <- min(informed_summary$P_ROPE)
+```
+
+**Conclusion.** The substantively informed priors do not change the qualitative conclusions of the primary analysis. Across all three outcomes the informed-prior APD posteriors remain tightly concentrated within the ROPE $[-0.05, +0.05]$, with posterior means shifting by at most `r sprintf("%.3f", max_apd_shift)` relative to the primary model and the posterior probability inside the ROPE staying above `r scales::percent(min_rope_inf, accuracy = 1)` for every outcome (Table A1, Figure A5). Anchoring the grand-mean prevalence prior at the observed baseline rate (~25%) and tightening the between-cluster SD prior to a literature-consistent ICC of ~0.034 sharpens the priors considerably but leaves the treatment-effect inference essentially unchanged. This is the expected and reassuring result: the conclusion that the Andilaye WASH intervention had no practically meaningful effect on women's mental health is driven by the data, not by the deliberately neutral priors of the primary model, and it persists when those priors are replaced with substantively motivated alternatives.
